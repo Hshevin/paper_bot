@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import re
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -13,6 +14,8 @@ from .paperbot.service import PaperService
 from .paperbot.errors import ConfigError, SafeError, diagnose, external_error, public_error
 
 
+PLUGIN_VERSION = "1.0.2"
+
 COMMAND_CONTEXT = {
     "run": "立即抓取与分析", "bind": "绑定当前会话订阅", "unbind": "取消当前会话订阅",
     "subscriptions": "查看当前会话订阅", "retry": "重试论文处理", "read": "手动全文精读",
@@ -20,7 +23,7 @@ COMMAND_CONTEXT = {
 }
 
 
-@register("astrbot_plugin_paper_bot", "Hshevin", "按研究方向筛选并推送 arXiv 论文", "1.0.1")
+@register("astrbot_plugin_paper_bot", "Hshevin", "按研究方向筛选并推送 arXiv 论文", PLUGIN_VERSION)
 class PaperBotPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -37,6 +40,42 @@ class PaperBotPlugin(Star):
         record = {"plugin": "astrbot_plugin_paper_bot", "event": "operation_failed", **report}
         self._log.error(f"[Paper Bot] {json.dumps(record, ensure_ascii=False)}")
 
+    @staticmethod
+    def _safe_package(module_name) -> str:
+        if not isinstance(module_name, str):
+            return ""
+        match = re.match(r"^(data\.plugins\.[A-Za-z0-9_-]{1,100})(?:\.|$)", module_name)
+        return match.group(1) if match else ""
+
+    def _runtime_identity(self) -> str:
+        core_version = getattr(self.service, "runtime_version", None)
+        if not isinstance(core_version, str) or not re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}", core_version):
+            core_version = "未知/旧版"
+        package = self._safe_package(self.__class__.__module__)
+        lines = [f"[Paper Bot] 入口运行版本：{PLUGIN_VERSION}；核心运行版本：{core_version}",
+                 f"加载包：{package or '非标准加载路径'}"]
+        if core_version != PLUGIN_VERSION:
+            lines.append("提示：入口与核心运行版本不一致，请检查实际加载的插件目录与更新来源。")
+        # Read only the official registry's name/module path. Never expose reprs,
+        # absolute paths or arbitrary metadata while diagnosing duplicate installs.
+        packages = {package} if package else set()
+        get_stars = getattr(self.context, "get_all_stars", None)
+        if callable(get_stars):
+            try:
+                stars = get_stars()
+                if isinstance(stars, (list, tuple)):
+                    for star in stars:
+                        if getattr(star, "name", None) == "astrbot_plugin_paper_bot":
+                            other = self._safe_package(getattr(star, "module_path", None))
+                            if other:
+                                packages.add(other)
+            except Exception:
+                # Registry introspection must not hide the original status/error.
+                pass
+        if len(packages) > 1:
+            lines.append(f"提示：同名插件存在 {len(packages)} 个安装目录：{'、'.join(sorted(packages))}。请核对保留的实例，避免旧副本响应命令。")
+        return "\n".join(lines)
+
     async def initialize(self):
         try:
             self.service = PaperService(
@@ -47,10 +86,12 @@ class PaperBotPlugin(Star):
                 report_error=self._report_error,
             )
         except Exception as exc:
+            self._log.info(self._runtime_identity())
             report = diagnose(exc, "初始化")
             self._report_error(report)
             self._startup_error = public_error(report)
             return
+        self._log.info(self._runtime_identity())
         self._task = asyncio.create_task(self._scheduler(), name="paper-bot-scheduler")
 
     async def _scheduler(self):
@@ -226,7 +267,11 @@ class PaperBotPlugin(Star):
     @filter.command("paper_status")
     async def paper_status(self, event: AstrMessageEvent):
         """查看论文抓取、待处理队列和推送状态。"""
-        yield await self._call(event, "status")
+        if not event.is_admin():
+            yield event.plain_result("此命令仅限 AstrBot 管理员。")
+            return
+        status = await self._invoke("status")
+        yield event.plain_result(self._runtime_identity() + "\n" + status)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("paper_topics")

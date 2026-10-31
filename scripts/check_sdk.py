@@ -117,6 +117,7 @@ async def check(workspace: Path):
     plugin = plugin_module.PaperBotPlugin(context, config)
     await plugin.initialize()
     assert plugin.service is not None, plugin._startup_error
+    assert plugin.service.runtime_version == metadata.version
     try:
         await asyncio.sleep(0)
         assert plugin.service.config is config

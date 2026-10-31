@@ -1,7 +1,7 @@
 name: astrbot_plugin_paper_bot
 display_name: Paper Bot 论文订阅
 desc: 根据研究描述筛选 arXiv 论文，调用指定模型分析摘要，并通过 QQ 定时推送至群聊或私聊。
-version: 1.0.1
+version: 1.0.2
 author: Hshevin
 repo: https://github.com/Hshevin/paper_bot
 astrbot_version: ">=4.10.4,<5"

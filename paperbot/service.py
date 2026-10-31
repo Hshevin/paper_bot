@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 import aiohttp
 
 from .arxiv import ArxivClient
-from .errors import ConfigError, SafeError, diagnose, public_error
+from .errors import ConfigError, SafeError, diagnose, pause_detail, public_error
 from .models import Paper, Topic
 from .scoring import eligible, screen
 from .storage import Storage, decode_paper
@@ -36,6 +36,8 @@ def bounded(config: dict, key: str, default: int, low: int, high: int) -> int:
 
 
 class PaperService:
+    runtime_version = "1.0.2"
+
     def __init__(self, data_dir: Path, config: dict,
                  generate: Callable[[str, str], Awaitable[str]],
                  send: Callable[[str, str], Awaitable[bool]], *, reader_generate=None, save_config=None, report_error=None, client=None, clock=None):
@@ -54,9 +56,10 @@ class PaperService:
         self.closed = False
         self._phase = "配置校验"
 
-    def _failure(self, exc: Exception, stage: str, context: str = "") -> str:
+    def _record_failure(self, exc: Exception, stage: str, context: str = "") -> dict:
         report = diagnose(exc, stage, context=context)
         report["time"] = self.clock().isoformat()
+        report["version"] = self.runtime_version
         if self.report_error is not None:
             self.report_error(report)
         # A broken store must not hide the original diagnostic or get reset.
@@ -64,7 +67,10 @@ class PaperService:
             self.store.set_meta("last_error", json.dumps(report, ensure_ascii=False))
         except (sqlite3.Error, OSError):
             pass
-        return public_error(report)
+        return report
+
+    def _failure(self, exc: Exception, stage: str, context: str = "") -> str:
+        return public_error(self._record_failure(exc, stage, context))
 
     def _topics(self) -> list[Topic]:
         raw = self.config.get("topics", [])
@@ -185,11 +191,18 @@ class PaperService:
     def status(self) -> str:
         pause = json.loads(self.store.meta("analysis_pause", "null"))
         counts = [len(self.config.get(k, [])) if isinstance(self.config.get(k, []), list) else 0 for k in ("topics", "subscriptions")]
-        message = (f"自动任务：{'已启用' if self.config.get('enabled', False) else '未启用'}\n"
-                f"运行中：{'是' if self.lock.locked() else '否'}\n"
+        running = self.lock.locked()
+        message = (f"Paper Bot 核心版本：{self.runtime_version}\n"
+                f"自动任务：{'已启用' if self.config.get('enabled', False) else '未启用'}\n"
+                f"运行中：{'是' if running else '否'}\n"
+                + (f"当前阶段：{self._phase}\n" if running else "") +
                 f"主题配置 {counts[0]} 条，订阅配置 {counts[1]} 条（含停用项）\n"
-                f"最近结果：{self.store.meta('last_status', '尚未运行')}\n"
-                f"模型筛选：{'已暂停，请检查提供商后 /paper_retry' if pause else '就绪'}")
+                f"模型筛选：{'已暂停，原因见下方' if pause else '就绪'}")
+        if pause:
+            message += "\n当前模型暂停原因：\n" + pause_detail(pause)
+        # Completed-round statistics are historical, not live progress.
+        last_status = next(iter(self.store.meta('last_status').splitlines()), '尚未完成任何轮次')
+        message += f"\n上一轮统计（历史记录）：{last_status}"
         last_error = json.loads(self.store.meta("last_error", "null"))
         if last_error and last_error["id"] not in message:
             message += "\n最近一次错误（历史记录）：\n" + public_error(last_error)
@@ -303,10 +316,11 @@ class PaperService:
                         raise
                     except Exception as exc:
                         failed += 1
-                        detail = self._failure(exc, "模型筛选", self._topic_context(topic))
+                        report = self._record_failure(exc, "模型筛选", f"{self._topic_context(topic)}，论文 {paper.id}v{paper.version}")
+                        detail = public_error(report)
                         failures.append(detail)
                         self.store.result(topic, paper, None, error=detail)
-                        self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": detail}))
+                        self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": detail, "report": report}))
                         paused = True
                         break
         for subscription in due:
@@ -347,6 +361,11 @@ class PaperService:
         message = f"本轮抓取 {fetched} 条，分析 {analyzed} 篇，成功投递 {sent} 条，失败 {failed} 项"
         if paused:
             message += "；模型筛选已暂停，请修复后 /paper_retry"
+            saved_pause = json.loads(self.store.meta("analysis_pause", "null"))
+            if saved_pause:
+                detail = pause_detail(saved_pause)
+                if detail not in failures:
+                    failures.insert(0, detail)
         if failures:
             message += "\n\n" + "\n\n".join(failures[:3])
             if len(failures) > 3:
@@ -360,6 +379,7 @@ class PaperService:
         if self.lock.locked():
             return "已有任务运行，请稍后重试"
         async with self.lock:
+            self._phase = "日期范围抓取"
             topic = next((t for t in self._topics() if t.id == topic_id), None)
             if topic is None:
                 return "未找到启用的主题 id，请 /paper_topics 查看"
@@ -415,6 +435,7 @@ class PaperService:
         if not self.config.get("reading_provider_id") and not self.config.get("provider_id"):
             return "请先配置模型提供商"
         async with self.lock:
+            self._phase = "全文精读"
             row = self.store.db.execute("SELECT data FROM papers WHERE id=? ORDER BY version DESC LIMIT 1", (paper_id,)).fetchone()
             if row is None:
                 return "该论文未入库，请使用已抓取论文的 arXiv ID（不含 v 版本后缀）"

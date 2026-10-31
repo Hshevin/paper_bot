@@ -83,6 +83,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin = self.module.PaperBotPlugin(self.context, FakeConfig(provider_id="chosen"))
         self.service = SimpleNamespace(
+            runtime_version="1.0.2",
             run=AsyncMock(return_value="done"), close=AsyncMock(),
             bind=Mock(return_value="bound"), unbind=Mock(return_value="unbound"),
             retry=AsyncMock(return_value="retry queued"), status=Mock(return_value="status"),
@@ -135,6 +136,50 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await anext(self.plugin.paper_unbind(self.event()))
         self.service.unbind.assert_called_once_with("qq-main:GroupMessage:12345")
 
+    async def test_status_shows_runtime_versions_and_safe_package_identity(self):
+        with patch.object(self.module.PaperBotPlugin, "__module__", "data.plugins.paper_bot.main"):
+            result = [x async for x in self.plugin.paper_status(self.event())]
+        self.assertTrue(result[0].startswith("[Paper Bot] 入口运行版本：1.0.2；核心运行版本：1.0.2"))
+        self.assertIn("加载包：data.plugins.paper_bot", result[0])
+        self.assertTrue(result[0].endswith("status"))
+        self.assertNotIn(str(ROOT), result[0])
+        self.assertEqual(self.module.PLUGIN_VERSION, "1.0.2")
+
+    async def test_status_warns_on_missing_or_mismatched_core_version(self):
+        for version in (None, "1.0.0", "private-secret\n/root/server"):
+            self.service.runtime_version = version
+            result = [x async for x in self.plugin.paper_status(self.event())]
+            self.assertIn("入口与核心运行版本不一致", result[0])
+            self.assertNotIn("private-secret", result[0])
+            self.assertNotIn("/root/server", result[0])
+
+    async def test_duplicate_plugin_directories_are_reported_without_arbitrary_metadata(self):
+        self.context.get_all_stars = Mock(return_value=[
+            SimpleNamespace(name="astrbot_plugin_paper_bot", module_path="data.plugins.paper_bot.main"),
+            SimpleNamespace(name="astrbot_plugin_paper_bot", module_path="data.plugins.paper_bot_copy.main"),
+            SimpleNamespace(name="astrbot_plugin_paper_bot", module_path="data.plugins.paper_bot.main"),
+            SimpleNamespace(name="other_plugin", module_path="data.plugins.other.main"),
+            SimpleNamespace(name="astrbot_plugin_paper_bot", module_path="/private-secret/install/path"),
+        ])
+        with patch.object(self.module.PaperBotPlugin, "__module__", "data.plugins.paper_bot.main"):
+            result = [x async for x in self.plugin.paper_status(self.event())]
+            with patch.object(self.module, "PaperService", return_value=self.service):
+                await self.plugin.initialize()
+            self.assertIn("同名插件存在 2 个安装目录", self.module.logger.info.call_args.args[0])
+            await self.plugin.terminate()
+        self.assertIn("同名插件存在 2 个安装目录", result[0])
+        self.assertIn("data.plugins.paper_bot_copy", result[0])
+        self.assertNotIn("private-secret", result[0])
+        self.assertNotIn("data.plugins.other", result[0])
+
+    async def test_runtime_identity_still_visible_after_service_initialization_fails(self):
+        self.plugin.service = None
+        self.plugin._startup_error = "初始化失败"
+        result = [x async for x in self.plugin.paper_status(self.event())]
+        self.assertIn("入口运行版本：1.0.2", result[0])
+        self.assertIn("核心运行版本：未知/旧版", result[0])
+        self.assertIn("初始化失败", result[0])
+
     async def test_explicit_provider_and_plain_result_are_used_without_tools(self):
         self.assertEqual(await self.plugin._generate("system", "abstract"), "result")
         self.context.llm_generate.assert_awaited_once_with(
@@ -167,6 +212,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin = self.module.PaperBotPlugin(self.context, FakeConfig())
         with patch.object(self.module, "PaperService", return_value=self.service) as factory:
             await self.plugin.initialize()
+        startup_log = self.module.logger.info.call_args.args[0]
+        self.assertIn("入口运行版本：1.0.2；核心运行版本：1.0.2", startup_log)
+        self.context.send_message.assert_not_awaited()
         self.assertIs(factory.call_args.args[1], self.plugin.config)
         self.assertIs(factory.call_args.kwargs["save_config"].__self__, self.plugin.config)
         self.assertIs(factory.call_args.kwargs["report_error"].__self__, self.plugin)

@@ -165,6 +165,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('/paper_retry', reply)
         saved = json.loads(self.service.store.meta('last_error'))
         self.assertEqual(reports[0]['id'], saved['id'])
+        pause = json.loads(self.service.store.meta('analysis_pause'))
+        self.assertEqual(pause['report'], saved)
+        self.assertIn('2610.00001v1', saved['context'])
         await self.restart_service()
         self.assertIn(saved['id'], self.service.status())
 
@@ -233,6 +236,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.run(force=True)
         self.assertEqual(self.generated, 2)
         self.assertEqual(len(self.sent), 2)
+
+    async def test_paused_reason_survives_later_fetch_errors_and_repeated_runs(self):
+        self.bad_model = True
+        first = await self.service.run(force=True)
+        pause = json.loads(self.service.store.meta('analysis_pause'))
+        cause_id = pause['report']['id']
+        self.assertIn('模型未返回有效 JSON', first)
+        self.feed.fetch_page = AsyncMock(side_effect=ArxivError('arXiv 请求失败（HTTP 429）'))
+        second = await self.service.run(force=True)
+        self.assertEqual(self.generated, 1)
+        self.assertIn('HTTP 429', second)
+        self.assertIn('模型未返回有效 JSON', second)
+        self.assertIn(cause_id, second)
+        self.assertNotEqual(json.loads(self.service.store.meta('last_error'))['id'], cause_id)
+        status = self.service.status()
+        self.assertLess(status.index('模型未返回有效 JSON'), status.index('上一轮统计'))
+        self.assertIn(cause_id, status)
+        self.assertFalse(self.sent)
 
     async def test_fetch_failure_does_not_advance_cursor(self):
         self.feed.fail = True
