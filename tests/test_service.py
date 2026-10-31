@@ -68,10 +68,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.sent = []
         self.fail_target = None
         self.bad_model = False
+        self.provider_error = None
         self.now = NOW
         self.scores = {}
         async def generate(system, user):
             self.generated += 1
+            if self.provider_error is not None:
+                raise self.provider_error
             if self.bad_model:
                 return 'invalid output'
             source = json.loads(user)
@@ -155,18 +158,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(reports[0]['id'], self.service.store.scan(self.service._topics()[0])['error'])
         self.assertIsNone(self.service.store.scan(self.service._topics()[0])['success'])
 
-    async def test_model_failure_has_actionable_cause_and_persistent_diagnostic(self):
+    async def test_invalid_model_output_has_persistent_diagnostic_without_global_pause(self):
         self.bad_model = True
         reports = []
         self.service.report_error = reports.append
         reply = await self.service.run(force=True)
-        self.assertIn('模型筛选', reply)
+        self.assertIn('模型输出校验', reply)
         self.assertIn('模型未返回有效 JSON', reply)
-        self.assertIn('/paper_retry', reply)
+        self.assertIn('单篇', reply)
         saved = json.loads(self.service.store.meta('last_error'))
-        self.assertEqual(reports[0]['id'], saved['id'])
-        pause = json.loads(self.service.store.meta('analysis_pause'))
-        self.assertEqual(pause['report'], saved)
+        self.assertEqual(reports[-1]['id'], saved['id'])
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+        self.assertEqual(self.generated, 2)
+        self.assertIn('分析 1 篇', reply)
+        self.assertIn('模型调用 2 次', reply)
+        self.assertFalse(self.sent)
+        self.assertFalse(self.service.store.pending(self.service._topics()[0], 100))
+        row = self.service.store.db.execute('SELECT analysis,error FROM papers').fetchone()
+        self.assertIsNone(row['analysis'])
+        self.assertIn(saved['id'], row['error'])
         self.assertIn('2610.00001v1', saved['context'])
         await self.restart_service()
         self.assertIn(saved['id'], self.service.status())
@@ -225,33 +235,195 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.generated, 1)
         self.assertEqual(len(self.sent), 2)
 
-    async def test_model_failure_pauses_across_rounds(self):
-        self.bad_model = True
+    async def test_provider_failure_pauses_across_rounds(self):
+        self.provider_error = RuntimeError('private provider response')
         await self.service.run(force=True)
         await self.service.run(force=True)
         self.assertEqual(self.generated, 1)
         self.assertFalse(self.sent)
-        self.bad_model = False
+        self.provider_error = None
         self.service.retry()
         await self.service.run(force=True)
         self.assertEqual(self.generated, 2)
         self.assertEqual(len(self.sent), 2)
 
+    async def test_invalid_paper_is_isolated_and_next_paper_still_delivered(self):
+        second = replace(PAPER, id='2610.00002', title='Another reasoning paper')
+        self.feed.papers_by_topic['reasoning'] = [PAPER, second]
+        self.config['max_analyses_per_run'] = 3
+        calls = []
+        async def generate(system, user):
+            paper_id = json.loads(user)['untrusted_paper']['id']
+            calls.append(paper_id)
+            if paper_id == PAPER.id + 'v1':
+                return 'invalid output'
+            return await self.generate_fn(system, user)
+        self.service.generate = generate
+        reply = await self.service.run(force=True)
+        self.assertEqual(calls, [PAPER.id + 'v1', PAPER.id + 'v1', second.id + 'v1'])
+        self.assertIn('分析 2 篇', reply)
+        self.assertIn('模型调用 3 次', reply)
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all(second.url in message and PAPER.url not in message for _, message in self.sent))
+        invalid = self.service.store.db.execute('SELECT analysis,error FROM papers WHERE id=?', (PAPER.id,)).fetchone()
+        self.assertIsNone(invalid['analysis'])
+        self.assertTrue(invalid['error'])
+        await self.service.run(force=True)
+        self.assertEqual(len(calls), 3, 'A permanently invalid paper must not be retried automatically')
+
+    async def test_local_preflight_rejection_does_not_spend_model_call_budget(self):
+        empty = replace(PAPER, abstract='')
+        second = replace(PAPER, id='2610.00002')
+        self.feed.papers_by_topic['reasoning'] = [empty, second]
+        self.config['max_analyses_per_run'] = 1
+        reply = await self.service.run(force=True)
+        self.assertEqual(self.generated, 1)
+        self.assertIn('模型调用 1 次', reply)
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all(second.url in message and empty.url not in message for _, message in self.sent))
+
+    async def test_correction_keeps_original_paper_and_accepts_only_verbatim_evidence(self):
+        prompts = []
+        async def generate(system, user):
+            prompts.append(json.loads(user))
+            if len(prompts) == 1:
+                return json.dumps({'score': 85, 'summary': '中文摘要', 'reason': '符合关注方向',
+                                   'evidence': ['我们研究搜索与推理']})
+            return json.dumps({'score': 85, 'summary': '中文摘要', 'reason': '符合关注方向',
+                               'evidence_ids': [1], 'evidence': ['我们研究搜索与推理']})
+        self.service.generate = generate
+        reply = await self.service.run(force=True)
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0]['untrusted_paper'], prompts[1]['untrusted_paper'])
+        self.assertEqual(''.join(segment['text'] for segment in prompts[1]['untrusted_paper']['abstract_segments']),
+                         PAPER.abstract)
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+        self.assertIn('模型调用 2 次', reply)
+        self.assertIn('分析 1 篇', reply)
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all('search and reasoning' in message and '我们研究搜索与推理' not in message
+                            for _, message in self.sent))
+        analysis = json.loads(self.service.store.db.execute('SELECT analysis FROM papers').fetchone()[0])
+        self.assertEqual(analysis['evidence'], [PAPER.abstract])
+
+    async def test_budget_one_defers_correction_across_restart_then_isolates_invalid_paper(self):
+        second = replace(PAPER, id='2610.00002')
+        self.feed.papers_by_topic['reasoning'] = [PAPER, second]
+        self.config['max_analyses_per_run'] = 1
+        calls = []
+        async def generate(system, user):
+            paper_id = json.loads(user)['untrusted_paper']['id']
+            calls.append(paper_id)
+            if paper_id == PAPER.id + 'v1':
+                return 'invalid output'
+            return await normal_generate(system, user)
+        normal_generate = self.generate_fn
+        self.generate_fn = self.service.generate = generate
+        first = await self.service.run(force=True)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('模型调用 1 次', first)
+        self.assertIn('待纠正 1 篇', first)
+        row = self.service.store.db.execute('SELECT analysis,error,correction FROM papers WHERE id=?', (PAPER.id,)).fetchone()
+        self.assertIsNone(row['analysis'])
+        self.assertIsNone(row['error'])
+        self.assertTrue(row['correction'])
+        self.assertFalse(self.sent)
+        await self.restart_service()
+        second_round = await self.service.run(force=True)
+        self.assertEqual(calls, [PAPER.id + 'v1', PAPER.id + 'v1'])
+        self.assertIn('模型调用 1 次', second_round)
+        self.assertIn('待纠正 0 篇', second_round)
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+        self.assertFalse(self.sent)
+        await self.restart_service()
+        third = await self.service.run(force=True)
+        self.assertEqual(calls, [PAPER.id + 'v1', PAPER.id + 'v1', second.id + 'v1'])
+        self.assertIn('模型调用 1 次', third)
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all(second.url in message for _, message in self.sent))
+        await self.service.run(force=True)
+        self.assertEqual(len(calls), 3)
+
+    async def test_provider_timeout_counts_as_a_call_and_pauses_without_leaking_detail(self):
+        self.provider_error = TimeoutError('Authorization=Bearer sk-private-provider-secret')
+        self.config['max_analyses_per_run'] = 1
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        self.assertIn('模型调用 1 次', reply)
+        self.assertEqual(self.generated, 1)
+        self.assertTrue(self.service.store.meta('analysis_pause'))
+        self.assertFalse(self.sent)
+        rendered = reply + self.service.status() + json.dumps(reports) + self.service.store.meta('analysis_pause')
+        self.assertNotIn('sk-private-provider-secret', rendered)
+        self.assertNotIn('Authorization', rendered)
+        await self.restart_service()
+        await self.service.run(force=True)
+        self.assertEqual(self.generated, 1)
+
+    async def test_provider_failure_during_correction_counts_both_calls_and_pauses(self):
+        second = replace(PAPER, id='2610.00002')
+        self.feed.papers_by_topic['reasoning'] = [PAPER, second]
+        calls = []
+        error = RuntimeError('Authorization=Bearer sk-private-provider-secret')
+        error.status_code = 429
+        async def generate(system, user):
+            calls.append(json.loads(user)['untrusted_paper']['id'])
+            if len(calls) == 1:
+                return 'invalid output'
+            raise external_error(error, '模型')
+        self.service.generate = generate
+        reply = await self.service.run(force=True)
+        self.assertEqual(calls, [PAPER.id + 'v1', PAPER.id + 'v1'])
+        self.assertIn('模型调用 2 次', reply)
+        self.assertIn('分析 1 篇', reply)
+        self.assertIn('HTTP 429', reply)
+        self.assertTrue(self.service.store.meta('analysis_pause'))
+        self.assertFalse(self.sent)
+        await self.service.run(force=True)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('sk-private-provider-secret', reply + self.service.status())
+
+    async def test_invalid_output_correction_does_not_need_model_config_changes(self):
+        config_before = deepcopy(self.config)
+        calls = []
+        secret = 'sk-private-output-secret'
+        async def generate(system, user):
+            calls.append((system, user))
+            if len(calls) == 1:
+                return json.dumps({'score': '85', 'summary': secret, 'reason': 'reason',
+                                   'evidence': ['search and reasoning']})
+            return await self.generate_fn(system, user)
+        self.service.generate = generate
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.config, config_before)
+        self.assertEqual(len(self.sent), 2)
+        rendered = reply + self.service.status() + json.dumps(reports) + calls[1][0] + calls[1][1]
+        self.assertNotIn(secret, rendered)
+        self.assertEqual(self.service.store.meta('analysis_pause'), '')
+
     async def test_paused_reason_survives_later_fetch_errors_and_repeated_runs(self):
-        self.bad_model = True
+        error = RuntimeError('private provider response')
+        error.status_code = 401
+        self.provider_error = external_error(error, '模型')
         first = await self.service.run(force=True)
         pause = json.loads(self.service.store.meta('analysis_pause'))
         cause_id = pause['report']['id']
-        self.assertIn('模型未返回有效 JSON', first)
+        self.assertIn('HTTP 401', first)
         self.feed.fetch_page = AsyncMock(side_effect=ArxivError('arXiv 请求失败（HTTP 429）'))
         second = await self.service.run(force=True)
         self.assertEqual(self.generated, 1)
         self.assertIn('HTTP 429', second)
-        self.assertIn('模型未返回有效 JSON', second)
+        self.assertIn('HTTP 401', second)
         self.assertIn(cause_id, second)
         self.assertNotEqual(json.loads(self.service.store.meta('last_error'))['id'], cause_id)
         status = self.service.status()
-        self.assertLess(status.index('模型未返回有效 JSON'), status.index('上一轮统计'))
+        self.assertLess(status.index('HTTP 401'), status.index('上一轮统计'))
         self.assertIn(cause_id, status)
         self.assertFalse(self.sent)
 

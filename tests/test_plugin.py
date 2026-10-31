@@ -1,10 +1,12 @@
 """Adapter contract tests with an AstrBot API stub, not a live QQ integration test."""
 
 import asyncio
+from datetime import datetime, timezone
 import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -83,7 +85,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin = self.module.PaperBotPlugin(self.context, FakeConfig(provider_id="chosen"))
         self.service = SimpleNamespace(
-            runtime_version="1.0.2",
+            runtime_version="1.0.3",
             run=AsyncMock(return_value="done"), close=AsyncMock(),
             bind=Mock(return_value="bound"), unbind=Mock(return_value="unbound"),
             retry=AsyncMock(return_value="retry queued"), status=Mock(return_value="status"),
@@ -139,11 +141,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_shows_runtime_versions_and_safe_package_identity(self):
         with patch.object(self.module.PaperBotPlugin, "__module__", "data.plugins.paper_bot.main"):
             result = [x async for x in self.plugin.paper_status(self.event())]
-        self.assertTrue(result[0].startswith("[Paper Bot] 入口运行版本：1.0.2；核心运行版本：1.0.2"))
+        self.assertTrue(result[0].startswith("[Paper Bot] 入口运行版本：1.0.3；核心运行版本：1.0.3"))
         self.assertIn("加载包：data.plugins.paper_bot", result[0])
         self.assertTrue(result[0].endswith("status"))
         self.assertNotIn(str(ROOT), result[0])
-        self.assertEqual(self.module.PLUGIN_VERSION, "1.0.2")
+        self.assertEqual(self.module.PLUGIN_VERSION, "1.0.3")
 
     async def test_status_warns_on_missing_or_mismatched_core_version(self):
         for version in (None, "1.0.0", "private-secret\n/root/server"):
@@ -176,7 +178,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.service = None
         self.plugin._startup_error = "初始化失败"
         result = [x async for x in self.plugin.paper_status(self.event())]
-        self.assertIn("入口运行版本：1.0.2", result[0])
+        self.assertIn("入口运行版本：1.0.3", result[0])
         self.assertIn("核心运行版本：未知/旧版", result[0])
         self.assertIn("初始化失败", result[0])
 
@@ -213,7 +215,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.module, "PaperService", return_value=self.service) as factory:
             await self.plugin.initialize()
         startup_log = self.module.logger.info.call_args.args[0]
-        self.assertIn("入口运行版本：1.0.2；核心运行版本：1.0.2", startup_log)
+        self.assertIn("入口运行版本：1.0.3；核心运行版本：1.0.3", startup_log)
         self.context.send_message.assert_not_awaited()
         self.assertIs(factory.call_args.args[1], self.plugin.config)
         self.assertIs(factory.call_args.kwargs["save_config"].__self__, self.plugin.config)
@@ -263,6 +265,48 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError) as raised:
             await self.plugin._generate("system", "abstract")
         self.assertNotIn("private-secret", str(raised.exception))
+
+    async def test_empty_sdk_completions_are_isolated_by_real_service_before_next_paper(self):
+        from paperbot.models import Paper
+        from paperbot.service import PaperService
+
+        now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        papers = [Paper(ident, 1, f"Paper {ident}", "Evidence from experiments.", (), ('cs.AI',), now, now)
+                  for ident in ('2610.00001', '2610.00002')]
+        self.plugin.config.update({
+            'enabled': True, 'max_analyses_per_run': 3,
+            'topics': [{'id': 'reasoning', 'name': 'Reasoning', 'description': 'Reasoning methods',
+                        'categories': ['cs.AI']}],
+            'subscriptions': [{'target': 'qq-main:GroupMessage:12345', 'topic_ids': ['reasoning'],
+                               'interval_minutes': 60}],
+        })
+        valid = json.dumps({'score': 85, 'summary': '中文摘要', 'reason': '相关理由', 'evidence_ids': [1]})
+        self.context.llm_generate.side_effect = [SimpleNamespace(completion_text=value)
+                                                for value in ('', None, valid)]
+        feed = SimpleNamespace(fetch_page=AsyncMock(return_value=(papers, 2)))
+        with tempfile.TemporaryDirectory() as directory:
+            core = PaperService(Path(directory), self.plugin.config, self.plugin._generate,
+                                self.plugin._send, client=feed, clock=lambda: now)
+            try:
+                with patch('paperbot.service.asyncio.sleep', new=AsyncMock()):
+                    reply = await core.run(force=True)
+                self.assertEqual(self.context.llm_generate.await_count, 3)
+                prompts = [json.loads(call.kwargs['prompt']) for call in self.context.llm_generate.await_args_list]
+                self.assertEqual([prompt['untrusted_paper']['id'] for prompt in prompts],
+                                 ['2610.00001v1', '2610.00001v1', '2610.00002v1'])
+                self.assertEqual(core.store.meta('analysis_pause'), '')
+                self.assertIn('模型调用 3 次', reply)
+                rows = {row['id']: row for row in core.store.db.execute('SELECT * FROM papers')}
+                self.assertIsNone(rows[papers[0].id]['analysis'])
+                self.assertTrue(rows[papers[0].id]['error'])
+                self.assertIsNotNone(rows[papers[1].id]['analysis'])
+                self.context.send_message.assert_awaited_once()
+                target, chain = self.context.send_message.await_args.args
+                self.assertEqual(target, 'qq-main:GroupMessage:12345')
+                self.assertIn(papers[1].url, chain.text)
+                self.assertNotIn(papers[0].url, chain.text)
+            finally:
+                await core.close()
 
     async def test_command_failure_does_not_echo_provider_exception(self):
         self.service.run.side_effect = RuntimeError("token=private-secret")

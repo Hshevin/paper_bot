@@ -1,4 +1,4 @@
-"""Status must explain an existing model pause without starting any work."""
+"""Status and legacy pause migration must not start external work."""
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from paperbot.arxiv import ArxivError
-from paperbot.errors import diagnose, public_error
+from paperbot.errors import diagnose, external_error, public_error
 from paperbot.scoring import ScoringError
 from paperbot.service import PaperService
 
@@ -46,9 +46,23 @@ class StatusDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.service.store.set_meta("last_error", json.dumps(report, ensure_ascii=False))
         return report
 
+    async def restart_service(self):
+        await self.service.close()
+        self.service = PaperService(
+            Path(self.directory.name), self.service.config,
+            self.generate, self.send, client=self.feed,
+            clock=lambda: datetime(2026, 11, 1, tzinfo=timezone.utc),
+        )
+
+    @staticmethod
+    def provider_report(status):
+        error = RuntimeError(f'private API key {SECRET}')
+        error.status_code = status
+        return diagnose(external_error(error, '模型'), '模型筛选', context='论文 2610.00001v1')
+
     async def test_status_shows_core_version_without_starting_work(self):
         status = self.service.status()
-        self.assertTrue(status.startswith("Paper Bot 核心版本：1.0.2"))
+        self.assertTrue(status.startswith("Paper Bot 核心版本：1.0.3"))
         self.assertIn("运行中：否", status)
 
     async def test_current_phase_is_shown_only_while_work_is_running(self):
@@ -72,19 +86,18 @@ class StatusDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("认证失败", status)
 
     async def test_legacy_public_pause_survives_a_new_unrelated_arxiv_failure(self):
-        report = diagnose(ScoringError("模型相关性评分必须为 0–100 的整数"), "模型筛选")
+        report = self.provider_report(401)
         self.pause({"signature": "x", "error": public_error(report)})
         later = self.later_arxiv_error()
         status = self.service.status()
-        self.assertIn("模型相关性评分必须为 0–100 的整数", status)
+        self.assertIn("HTTP 401", status)
         self.assertIn(report["id"], status)
         self.assertNotEqual(report["id"], later["id"])
         self.assertNotIn(MISSING_DETAIL, status)
 
     async def test_structured_pause_report_has_priority_over_legacy_error_and_last_error(self):
-        report = diagnose(ScoringError("模型提供的匹配依据不在论文摘要中，请重试"), "模型筛选",
-                          context="论文 2610.00001v1")
-        legacy = diagnose(ScoringError("模型未返回有效 JSON"), "模型筛选")
+        report = self.provider_report(429)
+        legacy = self.provider_report(401)
         self.pause({"signature": "x", "report": report, "error": public_error(legacy)})
         self.later_arxiv_error()
         status = self.service.status()
@@ -93,6 +106,38 @@ class StatusDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2610.00001v1", status)
         self.assertNotIn(legacy["message"], status)
         self.assertNotIn(legacy["id"], status)
+
+    async def test_startup_releases_legacy_scoring_pauses_without_any_network_work(self):
+        report = diagnose(ScoringError('模型提供的匹配依据不在论文摘要中，请重试'), '模型筛选')
+        for value in (
+            {'signature': 'x', 'error': 'ScoringError'},
+            {'signature': 'x', 'error': public_error(report)},
+            {'signature': 'x', 'error': public_error(report), 'report': report},
+        ):
+            with self.subTest(value=value):
+                self.pause(value)
+                later = self.later_arxiv_error()
+                await self.restart_service()
+                self.assertEqual(self.service.store.meta('analysis_pause'), '')
+                status = self.service.status()
+                self.assertIn('模型筛选：就绪', status)
+                self.assertIn(later['id'], status)
+
+    async def test_startup_preserves_provider_pauses_and_never_exposes_original_exception(self):
+        report = self.provider_report(401)
+        for value in (
+            {'signature': 'x', 'error': 'RuntimeError'},
+            {'signature': 'x', 'error': public_error(report)},
+            {'signature': 'x', 'error': public_error(report), 'report': report},
+        ):
+            with self.subTest(value=value):
+                self.pause(value)
+                await self.restart_service()
+                self.assertEqual(json.loads(self.service.store.meta('analysis_pause')), value)
+                status = self.service.status()
+                self.assertIn('模型筛选：已暂停', status)
+                self.assertNotIn(SECRET, status)
+                self.assertNotIn('private API key', status)
 
     async def test_arbitrary_legacy_text_is_not_treated_as_safe_diagnostic(self):
         for raw in (

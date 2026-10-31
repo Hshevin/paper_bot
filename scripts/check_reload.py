@@ -90,7 +90,7 @@ async def check(workspace: Path):
             assert sys.modules[package + ".paperbot.errors"].SDK_ERRORS_PROBE == "NEW_UPDATED"
             assert current.service.__class__ is not old_service.__class__
             assert old_task.done() and old_service.closed
-            assert sys.modules[package + ".main"].SafeError is sys.modules[package + ".paperbot.errors"].SafeError
+            assert sys.modules[package + ".main"].ConfigError is sys.modules[package + ".paperbot.errors"].ConfigError
             unchanged = [name for name, module in before.items() if sys.modules.get(name) is module]
             assert not unchanged, unchanged
             print(f"RELOAD PASS: {len(before)} plugin modules replaced; main/service/errors updated; old task/store closed.")

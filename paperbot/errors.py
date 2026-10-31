@@ -119,7 +119,8 @@ def diagnose(exc: Exception, stage: str, *, context: str = "") -> dict:
 def public_error(report: dict) -> str:
     context = _clip(report.get("context"), 180)
     location = f"\n位置：{context}" if context else ""
-    return (f"[Paper Bot] 失败阶段：{_clip(report.get('stage'), 50)}{location}\n"
+    heading = "[Paper Bot] 已跳过本篇，其他论文继续；阶段：" if report.get("scope") == "paper" else "[Paper Bot] 失败阶段："
+    return (f"{heading}{_clip(report.get('stage'), 50)}{location}\n"
             f"原因：{_clip(report.get('message'), 400)}\n"
             f"建议：{_clip(report.get('hint'), 250)}\n"
             f"诊断号：{_clip(report.get('id'), 16)}")
@@ -127,16 +128,33 @@ def public_error(report: dict) -> str:
 
 # These are immutable messages emitted by 1.0.1. Old arbitrary exception text
 # must never be promoted to a trusted diagnostic just because it has a prefix.
-_LEGACY_MODEL_MESSAGES = {
+_LEGACY_SCORING_MESSAGES = {
     "模型响应不是文本或超过大小上限", "模型返回的 JSON 代码块不完整",
     "模型未返回有效 JSON", "模型响应必须是 JSON 对象",
     "模型相关性评分必须为 0–100 的整数", "模型中文摘要缺失或过长",
     "模型推荐理由缺失或过长", "模型必须提供 1–5 个摘要原文短引文作为依据",
     "模型依据必须是简短的摘要原文引文", "模型提供的匹配依据不在论文摘要中，请重试",
     "论文不符合本主题的关键词过滤条件", "研究描述与论文摘要合计过长，本次未调用模型",
+}
+_LEGACY_MODEL_MESSAGES = _LEGACY_SCORING_MESSAGES | {
     "论文模型返回了空内容，请检查模型配置后重试。", "模型请求超时", "无法连接模型服务", "模型调用失败",
     "配置字段 provider_id：选定的聊天模型不存在或类型不匹配，请重新选择模型。",
 }
+
+
+def is_scoring_pause(pause: dict) -> bool:
+    """Recognize only validation pauses written by known older versions."""
+    report = pause.get("report")
+    if isinstance(report, dict) and report.get("type"):
+        return report["type"] == "ScoringError"
+    raw = pause.get("error")
+    if raw == "ScoringError":
+        return True
+    if not isinstance(raw, str):
+        return False
+    match = re.fullmatch(
+        r"\[Paper Bot\] 失败阶段：模型筛选(?:\n位置：[^\n]*)?\n原因：([^\n]*)\n建议：[^\n]*\n诊断号：([0-9a-f]{8})", raw)
+    return bool(match and match[1] in _LEGACY_SCORING_MESSAGES)
 
 
 def pause_detail(pause: dict) -> str:

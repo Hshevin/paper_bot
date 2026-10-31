@@ -11,10 +11,10 @@ from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .paperbot.service import PaperService
-from .paperbot.errors import ConfigError, SafeError, diagnose, external_error, public_error
+from .paperbot.errors import ConfigError, diagnose, external_error, public_error
 
 
-PLUGIN_VERSION = "1.0.2"
+PLUGIN_VERSION = "1.0.3"
 
 COMMAND_CONTEXT = {
     "run": "立即抓取与分析", "bind": "绑定当前会话订阅", "unbind": "取消当前会话订阅",
@@ -38,7 +38,8 @@ class PaperBotPlugin(Star):
 
     def _report_error(self, report: dict):
         record = {"plugin": "astrbot_plugin_paper_bot", "event": "operation_failed", **report}
-        self._log.error(f"[Paper Bot] {json.dumps(record, ensure_ascii=False)}")
+        log = self._log.warning if report.get("scope") == "paper" else self._log.error
+        log(f"[Paper Bot] {json.dumps(record, ensure_ascii=False)}")
 
     @staticmethod
     def _safe_package(module_name) -> str:
@@ -146,10 +147,10 @@ class PaperBotPlugin(Star):
             )
         except Exception as exc:
             raise external_error(exc, "模型") from exc
-        text = response.completion_text
-        if not isinstance(text, str) or not text.strip():
-            raise SafeError("论文模型返回了空内容，请检查模型配置后重试。")
-        return text
+        # A successful but empty response is invalid content, not a provider
+        # outage. Screening/reading owns its validation and retry policy.
+        text = getattr(response, "completion_text", None)
+        return text if isinstance(text, str) else ""
 
     async def _send(self, umo: str, text: str) -> bool:
         parts = umo.split(":", 2)

@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from .models import Paper, Screening, Topic
-from .errors import SafeError
+from .errors import SafeError, is_scoring_pause
 
 
 def encode_paper(paper: Paper) -> str:
@@ -45,7 +45,7 @@ class Storage:
                 topic TEXT NOT NULL, fingerprint TEXT NOT NULL,
                 id TEXT NOT NULL, version INTEGER NOT NULL,
                 data TEXT NOT NULL, analysis TEXT, model TEXT,
-                error TEXT, excluded INTEGER NOT NULL DEFAULT 0,
+                error TEXT, excluded INTEGER NOT NULL DEFAULT 0, correction TEXT,
                 PRIMARY KEY(topic, fingerprint, id)
             );
             CREATE TABLE IF NOT EXISTS delivered (
@@ -54,11 +54,17 @@ class Storage:
                 PRIMARY KEY(target, topic, fingerprint, id, version)
             );
         """)
-        columns = {r[1] for r in self.db.execute("PRAGMA table_info(scans)")}
-        if "horizon" not in columns:
-            with self.db:
+        # Lock before inspecting the schema so simultaneous opens cannot both
+        # attempt the same migration. Existing rows and delivery history survive.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            columns = {r[1] for r in self.db.execute("PRAGMA table_info(scans)")}
+            if "horizon" not in columns:
                 self.db.execute("ALTER TABLE scans ADD COLUMN horizon TEXT")
                 self.db.execute("UPDATE scans SET horizon=until")
+            columns = {r[1] for r in self.db.execute("PRAGMA table_info(papers)")}
+            if "correction" not in columns:
+                self.db.execute("ALTER TABLE papers ADD COLUMN correction TEXT")
 
     def meta(self, key: str, default: str = "") -> str:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -93,7 +99,7 @@ class Storage:
             for paper in papers:
                 self.db.execute("""INSERT INTO papers(topic,fingerprint,id,version,data) VALUES (?,?,?,?,?)
                     ON CONFLICT(topic,fingerprint,id) DO UPDATE SET
-                    version=excluded.version,data=excluded.data,analysis=NULL,model=NULL,error=NULL,excluded=0
+                    version=excluded.version,data=excluded.data,analysis=NULL,model=NULL,error=NULL,excluded=0,correction=NULL
                     WHERE excluded.version > papers.version""",
                     (topic.id, topic.fingerprint, paper.id, paper.version, encode_paper(paper)))
             if done:
@@ -116,12 +122,47 @@ class Storage:
             AND analysis IS NULL AND excluded=0 AND error IS NULL ORDER BY rowid ASC LIMIT ?""",
             (topic.id, topic.fingerprint, limit)).fetchall()
 
+    def correction_count(self, topics: list[Topic]) -> int:
+        return sum(self.db.execute("""SELECT COUNT(*) FROM papers
+            WHERE topic=? AND fingerprint=? AND analysis IS NULL AND excluded=0
+            AND error IS NULL AND correction IS NOT NULL""", (topic.id, topic.fingerprint)).fetchone()[0]
+            for topic in topics)
+
     def result(self, topic: Topic, paper: Paper, analysis: Screening | None, model: str = "", error: str | None = None, excluded=False):
         with self.db:
-            self.db.execute("""UPDATE papers SET analysis=?,model=?,error=?,excluded=?
+            self.db.execute("""UPDATE papers SET analysis=?,model=?,error=?,excluded=?,correction=NULL
                 WHERE topic=? AND fingerprint=? AND id=? AND version=?""",
                 (json.dumps(asdict(analysis), ensure_ascii=False) if analysis else None, model, error, int(excluded),
                  topic.id, topic.fingerprint, paper.id, paper.version))
+
+    def defer_correction(self, topic: Topic, paper: Paper, message: str):
+        """Persist one correction opportunity; message must be application-authored."""
+        if not isinstance(message, str) or not message.strip() or len(message) > 2000:
+            raise ValueError("纠正提示必须是非空文本且不超过 2000 字符")
+        with self.db:
+            self.db.execute("""UPDATE papers SET correction=?,error=NULL
+                WHERE topic=? AND fingerprint=? AND id=? AND version=? AND analysis IS NULL""",
+                (message, topic.id, topic.fingerprint, paper.id, paper.version))
+
+    def resume_legacy_scoring_pause(self) -> bool:
+        """Recover only a confirmed old validation pause, leaving provider failures alone."""
+        with self.db:
+            # Read and update the pause under the same SQLite write lock. A
+            # concurrent worker must not replace it between inspection/deletion.
+            self.db.execute("BEGIN IMMEDIATE")
+            pause = json.loads(self.meta("analysis_pause", "null"))
+            if pause is None:
+                return False
+            if not isinstance(pause, dict):
+                raise ValueError("模型暂停记录必须是 JSON 对象")
+            error = pause.get("error")
+            if not is_scoring_pause(pause):
+                return False
+            if isinstance(error, str):
+                self.db.execute("""UPDATE papers SET error=NULL,correction=NULL
+                    WHERE analysis IS NULL AND error=?""", (error,))
+            self.db.execute("DELETE FROM meta WHERE key='analysis_pause'")
+            return True
 
     def recommendations(self, topic: Topic, target: str, limit: int):
         rows = self.db.execute("""SELECT p.* FROM papers p WHERE topic=? AND fingerprint=?
@@ -137,7 +178,7 @@ class Storage:
 
     def retry(self):
         with self.db:
-            self.db.execute("UPDATE papers SET error=NULL WHERE analysis IS NULL")
+            self.db.execute("UPDATE papers SET error=NULL,correction=NULL WHERE analysis IS NULL")
             self.db.execute("DELETE FROM meta WHERE key='analysis_pause'")
 
     def close(self):

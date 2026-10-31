@@ -15,7 +15,7 @@ import aiohttp
 from .arxiv import ArxivClient
 from .errors import ConfigError, SafeError, diagnose, pause_detail, public_error
 from .models import Paper, Topic
-from .scoring import eligible, screen
+from .scoring import ScoringError, eligible, screen
 from .storage import Storage, decode_paper
 
 UTC = timezone.utc
@@ -36,7 +36,7 @@ def bounded(config: dict, key: str, default: int, low: int, high: int) -> int:
 
 
 class PaperService:
-    runtime_version = "1.0.2"
+    runtime_version = "1.0.3"
 
     def __init__(self, data_dir: Path, config: dict,
                  generate: Callable[[str, str], Awaitable[str]],
@@ -44,6 +44,11 @@ class PaperService:
         self.config = config
         self.data_dir = data_dir
         self.store = Storage(data_dir)
+        try:
+            self.resumed_validation_pause = self.store.resume_legacy_scoring_pause()
+        except Exception:
+            self.store.close()
+            raise
         self.generate = generate
         self.reader_generate = reader_generate or generate
         self.save_config = save_config
@@ -56,10 +61,11 @@ class PaperService:
         self.closed = False
         self._phase = "配置校验"
 
-    def _record_failure(self, exc: Exception, stage: str, context: str = "") -> dict:
+    def _record_failure(self, exc: Exception, stage: str, context: str = "", *, scope: str = "task") -> dict:
         report = diagnose(exc, stage, context=context)
         report["time"] = self.clock().isoformat()
         report["version"] = self.runtime_version
+        report["scope"] = scope
         if self.report_error is not None:
             self.report_error(report)
         # A broken store must not hide the original diagnostic or get reset.
@@ -200,11 +206,15 @@ class PaperService:
                 f"模型筛选：{'已暂停，原因见下方' if pause else '就绪'}")
         if pause:
             message += "\n当前模型暂停原因：\n" + pause_detail(pause)
+        if self.resumed_validation_pause:
+            message += "\n升级恢复：已解除旧版单篇输出校验导致的全局暂停；该篇可重新处理。"
         # Completed-round statistics are historical, not live progress.
         last_status = next(iter(self.store.meta('last_status').splitlines()), '尚未完成任何轮次')
         message += f"\n上一轮统计（历史记录）：{last_status}"
         last_error = json.loads(self.store.meta("last_error", "null"))
         if last_error and last_error["id"] not in message:
+            if last_error.get("type") == "ScoringError" and not pause and last_error.get("scope") != "paper":
+                last_error = {**last_error, "hint": "这是旧版的单篇输出校验记录，当前队列没有因此暂停；已按新策略恢复处理，无需据此修改 API 配置。"}
             message += "\n最近一次错误（历史记录）：\n" + public_error(last_error)
         return message
 
@@ -256,7 +266,15 @@ class PaperService:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
             self.client = ArxivClient(self.session)
         fetched = analyzed = sent = failed = 0
+        model_calls = deferred = skipped = 0
         failures = []
+
+        async def counted_generate(system: str, user: str) -> str:
+            # screen makes exactly one call; both initial and correction calls
+            # consume the same round budget, including failures/timeouts.
+            nonlocal model_calls
+            model_calls += 1
+            return await self.generate(system, user)
         # Rotate topics across bounded rounds so a large first topic cannot starve later ones.
         rotation = int(self.store.meta("rotation", "0")) % len(topics)
         ordered = topics[rotation:] + topics[:rotation]
@@ -298,7 +316,7 @@ class PaperService:
             self.store.retry()
         if not paused:
             for topic in ordered:
-                if analyzed >= analysis_budget or paused:
+                if model_calls >= analysis_budget or paused:
                     break
                 # Include excluded candidates without spending the LLM budget; bound CPU work.
                 for row in self.store.pending(topic, max(analysis_budget * 10, 100)):
@@ -306,22 +324,51 @@ class PaperService:
                     if not eligible(paper, topic):
                         self.store.result(topic, paper, None, excluded=True)
                         continue
-                    if analyzed >= analysis_budget:
+                    if model_calls >= analysis_budget:
                         break
                     analyzed += 1
-                    try:
-                        result = await screen(paper, topic, self.generate)
-                        self.store.result(topic, paper, result, model=provider)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        failed += 1
-                        report = self._record_failure(exc, "模型筛选", f"{self._topic_context(topic)}，论文 {paper.id}v{paper.version}")
-                        detail = public_error(report)
-                        failures.append(detail)
-                        self.store.result(topic, paper, None, error=detail)
-                        self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": detail, "report": report}))
-                        paused = True
+                    correction = row["correction"]
+                    while model_calls < analysis_budget:
+                        self._phase = "模型输出纠正" if correction is not None else "模型筛选"
+                        try:
+                            result = await screen(paper, topic, counted_generate, correction=correction)
+                        except asyncio.CancelledError:
+                            raise
+                        except ScoringError as exc:
+                            if exc.retryable and correction is None:
+                                correction = exc.code
+                                self._phase = "保存待纠正论文"
+                                self.store.defer_correction(topic, paper, correction)
+                                if model_calls >= analysis_budget:
+                                    deferred += 1
+                                continue
+                            # Invalid output belongs to this paper. It is never
+                            # a provider outage and must not pause other papers.
+                            failed += 1; skipped += 1
+                            report = self._record_failure(exc, "模型输出校验", f"{self._topic_context(topic)}，论文 {paper.id}v{paper.version}", scope="paper")
+                            detail = public_error(report)
+                            failures.append(detail)
+                            self._phase = "保存筛选结果"
+                            self.store.result(topic, paper, None, error=detail)
+                            break
+                        except Exception as exc:
+                            # Connection/auth/rate-limit and unexpected model
+                            # errors still stop paid calls across the queue.
+                            failed += 1
+                            report = self._record_failure(exc, "模型筛选", f"{self._topic_context(topic)}，论文 {paper.id}v{paper.version}")
+                            detail = public_error(report)
+                            failures.append(detail)
+                            self._phase = "保存模型故障"
+                            self.store.result(topic, paper, None, error=detail)
+                            self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": detail, "report": report}))
+                            paused = True
+                            break
+                        else:
+                            # Keep database errors outside the provider handler.
+                            self._phase = "保存筛选结果"
+                            self.store.result(topic, paper, result, model=provider)
+                            break
+                    if paused:
                         break
         for subscription in due:
             self._phase = "QQ 推送"
@@ -358,7 +405,12 @@ class PaperService:
                 seen.add((paper.id, paper.version))
                 sent += 1; target_sent += 1
                 await asyncio.sleep(1)
-        message = f"本轮抓取 {fetched} 条，分析 {analyzed} 篇，成功投递 {sent} 条，失败 {failed} 项"
+        pending_corrections = self.store.correction_count(all_topics)
+        message = f"本轮抓取 {fetched} 条，分析 {analyzed} 篇，模型调用 {model_calls} 次，待纠正 {pending_corrections} 篇，成功投递 {sent} 条，失败 {failed} 项"
+        if skipped:
+            message += f"；单篇输出不合规，已跳过 {skipped} 篇，其他论文继续处理"
+        if deferred:
+            message += "；本轮调用额度已用完，待纠正论文下轮继续，不增加额度"
         if paused:
             message += "；模型筛选已暂停，请修复后 /paper_retry"
             saved_pause = json.loads(self.store.meta("analysis_pause", "null"))
