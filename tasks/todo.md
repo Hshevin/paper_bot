@@ -4,4 +4,4 @@
 - [x] 插件入口、WebUI 同源配置、管理员命令、生命周期
 - [x] 故障回归与真实 SDK 兼容导入；在线 arXiv 返回 429，QQ/付费 LLM 未实测
 - [x] README、设计记录与安装包
-- [ ] 远端提交与交付
+- [x] 远端提交与交付：Hshevin/paper_bot main；安装包 dist/astrbot_plugin_paper_bot.zip
