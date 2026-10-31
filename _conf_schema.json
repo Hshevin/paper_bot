@@ -1,0 +1,162 @@
+{
+  "enabled": {
+    "description": "启用自动抓取和推送",
+    "type": "bool",
+    "default": false,
+    "hint": "先配置模型、研究主题和各群聊/私聊的独立订阅。关闭后仍可由管理员使用 /paper_run 手动执行。"
+  },
+  "provider_id": {
+    "description": "论文分析模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "先在 AstrBot 模型提供商中配置服务商、API 地址、密钥与模型，再在此选择。所有主题使用此模型，切换此处即可切换提供商。"
+  },
+  "interval_minutes": {
+    "description": "默认订阅间隔（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "用于没有填写间隔的订阅配置。每个群聊和私聊可在自己的订阅中覆盖此间隔。",
+    "slider": {"min": 15, "max": 1440, "step": 5}
+  },
+  "reading_provider_id": {
+    "description": "手动全文精读模型（可选）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "仅 /paper_read 手动全文精读使用。留空复用论文分析模型；可选择上下文容量更大的模型。"
+  },
+  "lookback_days": {
+    "description": "首次抓取回溯天数",
+    "type": "int",
+    "default": 7,
+    "hint": "首次订阅从最近若干天开始，之后按已完成抓取的时间游标增量更新。",
+    "slider": {"min": 1, "max": 365, "step": 1}
+  },
+  "max_pages_per_run": {
+    "description": "每轮每主题最多抓取页数",
+    "type": "int",
+    "default": 3,
+    "hint": "达到上限会保留分页进度，后续继续；完整抓取成功后才推进时间游标。",
+    "slider": {"min": 1, "max": 30, "step": 1}
+  },
+  "max_analyses_per_run": {
+    "description": "每轮最多模型分析篇数",
+    "type": "int",
+    "default": 20,
+    "hint": "控制模型费用。自动分析只发送标题和摘要，不下载全文。未处理论文留待后续轮次。",
+    "slider": {"min": 1, "max": 200, "step": 1}
+  },
+  "max_push_per_target": {
+    "description": "每轮每个目标最多推送篇数",
+    "type": "int",
+    "default": 5,
+    "hint": "每个订阅仅选择其研究方向中达到阈值且相关性最高的论文，按分数排序后最多推送此数量。",
+    "slider": {"min": 1, "max": 50, "step": 1}
+  },
+  "subscriptions": {
+    "description": "群聊与私聊的独立订阅",
+    "type": "template_list",
+    "default": [],
+    "hint": "例如群 A 订阅 graph、reasoning，每 60 分钟推送；私聊 B 订阅 robotics，每 180 分钟推送。每个会话只接收自己订阅方向中最相关的论文。",
+    "templates": {
+      "subscription": {
+        "name": "会话订阅",
+        "display_item": "target",
+        "items": {
+          "target": {
+            "description": "QQ 群聊或私聊会话标识",
+            "type": "string",
+            "default": "",
+            "hint": "在目标会话发送 /paper_target 后复制完整标识，如 qq-main:GroupMessage:123456 或 qq-main:FriendMessage:789012。首段为机器人实例 ID。需要 OneBot v11（如 NapCat）。"
+          },
+          "topic_ids": {
+            "description": "此会话订阅的主题 ID",
+            "type": "list",
+            "default": [],
+            "hint": "从下方研究主题目录选择 ID，例如 graph、reasoning。必须明确填写，留空不会订阅全部主题。用 /paper_topics 可查看目录。"
+          },
+          "interval_minutes": {
+            "description": "此会话推送间隔（分钟）",
+            "type": "int",
+            "default": 60,
+            "slider": {"min": 15, "max": 1440, "step": 5}
+          },
+          "enabled": {
+            "description": "启用此会话订阅",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  },
+  "topics": {
+    "description": "共享研究主题目录",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "research_topic": {
+        "name": "研究主题",
+        "display_item": "name",
+        "hint": "分类与关键词负责召回，详细研究描述负责模型语义筛选。",
+        "items": {
+          "id": {
+            "description": "主题唯一 ID",
+            "type": "string",
+            "default": "",
+            "hint": "填写 1–64 位英文字母、数字、下划线或短横线，例如 graph-reasoning。每个主题必须不同，订阅后保持稳定。"
+          },
+          "name": {
+            "description": "主题名称",
+            "type": "string",
+            "default": ""
+          },
+          "description": {
+            "description": "详细研究兴趣",
+            "type": "text",
+            "default": "",
+            "hint": "描述研究问题、关注的方法、希望看到的证据和不关心的方向。可使用中文，模型按此判断相关性。"
+          },
+          "categories": {
+            "description": "arXiv 分类",
+            "type": "list",
+            "default": [],
+            "hint": "例如 cs.AI、cs.LG、cs.CL。至少填写分类或关键词之一。"
+          },
+          "keywords": {
+            "description": "英文关键词与同义词",
+            "type": "list",
+            "default": [],
+            "hint": "例如 graph neural network、GNN。可填写多词短语；不填写 arXiv 查询语法。"
+          },
+          "exclude_keywords": {
+            "description": "排除关键词",
+            "type": "list",
+            "default": [],
+            "hint": "标题或摘要包含任一排除词的论文不会进行模型分析。"
+          },
+          "threshold": {
+            "description": "推荐分数阈值",
+            "type": "int",
+            "default": 70,
+            "hint": "模型按详细研究兴趣评分（0–100），达到阈值并有可核对的原文依据才推送。",
+            "slider": {"min": 0, "max": 100, "step": 1}
+          },
+          "retrieval_mode": {
+            "description": "候选召回策略",
+            "type": "string",
+            "default": "broad",
+            "options": ["broad", "strict"],
+            "hint": "broad：有分类时按分类召回，不要求关键词命中；没有分类时才按关键词召回。strict：同时满足分类和关键词（两者均已填写时），候选更少、模型费用更低。"
+          },
+          "enabled": {
+            "description": "启用此主题",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  }
+}
