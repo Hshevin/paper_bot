@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -30,6 +31,8 @@ class MessageChain:
 class Star:
     def __init__(self, context):
         self.context = context
+        if hasattr(context, "plugin_logger"):
+            self.logger = context.plugin_logger
 
 
 def decorator(*args, **kwargs):
@@ -166,6 +169,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.initialize()
         self.assertIs(factory.call_args.args[1], self.plugin.config)
         self.assertIs(factory.call_args.kwargs["save_config"].__self__, self.plugin.config)
+        self.assertIs(factory.call_args.kwargs["report_error"].__self__, self.plugin)
         self.plugin.config["subscriptions"] = [{"target": "qq-main:GroupMessage:12345", "topic_ids": ["graph"]}]
         factory.call_args.kwargs["save_config"]()
         self.assertEqual(self.plugin.config.saved["subscriptions"], self.plugin.config["subscriptions"])
@@ -208,7 +212,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_exception_does_not_echo_credentials(self):
         self.context.llm_generate.side_effect = RuntimeError("token=private-secret")
-        with self.assertRaises(RuntimeError) as raised:
+        with self.assertRaises(ValueError) as raised:
             await self.plugin._generate("system", "abstract")
         self.assertNotIn("private-secret", str(raised.exception))
 
@@ -217,6 +221,93 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         result = [x async for x in self.plugin.paper_run(self.event())]
         self.assertIn("失败", result[-1])
         self.assertNotIn("private-secret", "".join(result))
+        self.assertIn("诊断", result[-1])
+        payload = self.module.logger.error.call_args.args[0]
+        self.assertTrue(payload.startswith("[Paper Bot] "))
+        report = json.loads(payload.removeprefix("[Paper Bot] "))
+        self.assertEqual(report["stage"], "管理员命令")
+        self.assertTrue(report["trace"])
+        self.assertIn(report["id"], result[-1])
+        self.assertNotIn(str(ROOT), payload)
+        self.assertNotIn("private-secret", payload)
+        self.assertFalse(self.module.logger.error.call_args.kwargs.get("exc_info"))
+
+    async def test_http_statuses_are_visible_without_remote_error_body(self):
+        class RemoteError(Exception):
+            def __init__(self, status):
+                super().__init__("Authorization: Bearer private-secret")
+                self.status_code = status
+
+        for status in (401, 429):
+            self.context.llm_generate.side_effect = RemoteError(status)
+            # AsyncMock must await the bridge, as the real service does.
+            async def run(**kwargs):
+                return await self.plugin._generate("system", "abstract")
+            self.service.run.side_effect = run
+            result = [x async for x in self.plugin.paper_run(self.event())]
+            self.assertIn(str(status), result[-1])
+            self.assertIn("诊断", result[-1])
+            self.assertNotIn("private-secret", "".join(result))
+            self.assertNotIn("private-secret", self.module.logger.error.call_args.args[0])
+
+    async def test_qq_http_error_preserves_status_without_credentials(self):
+        error = RuntimeError("token=private-secret")
+        error.status = 429
+        self.context.send_message.side_effect = error
+        with self.assertRaises(ValueError) as raised:
+            await self.plugin._send("qq-main:GroupMessage:12345", "paper")
+        self.assertIn("429", str(raised.exception))
+        self.assertNotIn("private-secret", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, error)
+
+    async def test_dedicated_plugin_logger_is_used_when_sdk_provides_it(self):
+        dedicated = Mock()
+        self.context.plugin_logger = dedicated
+        plugin = self.module.PaperBotPlugin(self.context, FakeConfig())
+        plugin.service = self.service
+        self.service.run.side_effect = RuntimeError("token=private-secret")
+        [x async for x in plugin.paper_run(self.event())]
+        dedicated.error.assert_called_once()
+        self.module.logger.error.assert_not_called()
+
+    async def test_startup_error_is_actionable_and_does_not_log_raw_exception(self):
+        with patch.object(self.module, "PaperService", side_effect=ValueError("token=private-secret")):
+            await self.plugin.initialize()
+        self.assertIn("诊断", self.plugin._startup_error)
+        self.assertNotIn("private-secret", self.plugin._startup_error)
+        report = json.loads(self.module.logger.error.call_args.args[0].removeprefix("[Paper Bot] "))
+        self.assertEqual(report["stage"], "初始化")
+
+    async def test_command_diagnostics_do_not_include_untrusted_arguments(self):
+        self.service.read.side_effect = ValueError("token=private-secret")
+        [x async for x in self.plugin.paper_read(self.event(), "untrusted-secret-argument")]
+        payload = self.module.logger.error.call_args.args[0]
+        self.assertNotIn("untrusted-secret-argument", payload)
+        self.assertNotIn("private-secret", payload)
+
+    async def test_scheduler_failure_is_reported_in_status_without_sending_message(self):
+        self.service.run.side_effect = RuntimeError("token=private-secret")
+        with patch.object(self.module.asyncio, "sleep", side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.plugin._scheduler()
+        report = json.loads(self.module.logger.error.call_args.args[0].removeprefix("[Paper Bot] "))
+        self.assertEqual(report["stage"], "调度")
+        result = [x async for x in self.plugin.paper_status(self.event())]
+        self.assertIn("诊断", result[-1])
+        self.assertNotIn("private-secret", result[-1])
+        self.context.send_message.assert_not_awaited()
+
+    async def test_service_report_is_not_logged_twice_by_command_adapter(self):
+        report = self.module.diagnose(ValueError("token=private-secret"), "分析")
+
+        async def handled_run(**kwargs):
+            self.plugin._report_error(report)
+            return self.module.public_error(report)
+
+        self.service.run.side_effect = handled_run
+        result = [x async for x in self.plugin.paper_run(self.event())]
+        self.assertIn("诊断", result[-1])
+        self.module.logger.error.assert_called_once()
 
     async def test_manual_read_chunks_report_and_uses_reading_model(self):
         self.plugin.config["reading_provider_id"] = "reading"

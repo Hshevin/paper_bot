@@ -61,6 +61,7 @@ async def check(workspace: Path):
     assert issubclass(plugin_module.PaperBotPlugin, Star)
     assert star_map[plugin_module.__name__].star_cls_type is plugin_module.PaperBotPlugin
     assert star_map[plugin_module.__name__].name == metadata.name
+    assert star_map[plugin_module.__name__].version == metadata.version
 
     def event(message: str, *, admin: bool = True):
         message_obj = AstrBotMessage()

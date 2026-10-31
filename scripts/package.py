@@ -5,7 +5,7 @@ import zipfile
 root = Path(__file__).resolve().parents[1]
 destination = root / "dist" / "astrbot_plugin_paper_bot.zip"
 destination.parent.mkdir(exist_ok=True)
-paths = [root / name for name in ("main.py", "metadata.yaml", "_conf_schema.json", "requirements.txt", "README.md")]
+paths = [root / name for name in ("main.py", "metadata.yaml", "_conf_schema.json", "requirements.txt", "README.md", "CHANGELOG.md")]
 paths += sorted((root / "paperbot").glob("*.py"))
 paths += sorted((root / "docs").glob("*.md"))
 with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:

@@ -122,7 +122,7 @@
             "description": "arXiv 分类",
             "type": "list",
             "default": [],
-            "hint": "例如 cs.AI、cs.LG、cs.CL。至少填写分类或关键词之一。"
+            "hint": "例如 cs.AI、cs.CV、cs.CL、cs.LG，每个分类单独添加。分类点号周围的空格会自动忽略；至少填写分类或关键词之一。"
           },
           "keywords": {
             "description": "英文关键词与同义词",

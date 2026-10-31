@@ -12,6 +12,7 @@ import aiohttp
 from pypdf import PdfReader
 
 from .models import Paper
+from .errors import SafeError
 
 
 MAX_PDF_BYTES = 40 * 1024 * 1024
@@ -30,7 +31,7 @@ REPORT_TASK = """请给出论文精读报告：研究问题、核心贡献、方
 不把摘要中的主张冒充已经验证的结果。报告控制在 6000 个中文字以内。"""
 
 
-class ReadingError(ValueError):
+class ReadingError(SafeError):
     """A safe, user-facing error that contains no remote response bodies."""
 
 

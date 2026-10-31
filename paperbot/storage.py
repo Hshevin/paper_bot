@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from .models import Paper, Screening, Topic
+from .errors import SafeError
 
 
 def encode_paper(paper: Paper) -> str:
@@ -82,7 +83,7 @@ class Storage:
         start, end = datetime.fromisoformat(scan["since"]), datetime.fromisoformat(scan["until"])
         middle = (start + (end - start) / 2).replace(second=0, microsecond=0)
         if middle <= start or end - start < timedelta(minutes=2):
-            raise ValueError("单分钟结果超过 arXiv 上限，请缩小主题分类")
+            raise SafeError("单分钟结果超过 arXiv 上限，请缩小主题分类")
         with self.db:
             self.db.execute("UPDATE scans SET until=?,offset=0,error=NULL WHERE topic=?", (middle.isoformat(), topic.id))
 

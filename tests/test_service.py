@@ -10,6 +10,8 @@ from unittest.mock import patch, AsyncMock, Mock
 
 from paperbot.models import Paper, Topic
 from paperbot.service import PaperService, validate_target
+from paperbot.arxiv import ArxivError
+from paperbot.errors import external_error
 
 NOW = datetime(2026, 10, 31, tzinfo=timezone.utc)
 PAPER = Paper('2610.00001', 1, 'Search for reasoning', 'We study search and reasoning with explicit experiments.', ('Alice',), ('cs.AI',), NOW, NOW)
@@ -101,6 +103,115 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t for t, _ in self.sent].count('qq:FriendMessage:456'), 2)
         self.assertIn('search and reasoning', self.sent[0][1])
         self.assertIn('https://arxiv.org/abs/2610.00001v1', self.sent[0][1])
+
+    async def test_config_failure_identifies_webui_row_and_field_in_reply_log_and_status(self):
+        self.config['topics'][0]['categories'] = ['cat:cs.AI']
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        self.assertIn('配置校验', reply)
+        self.assertIn('研究主题第 1 项', reply)
+        self.assertIn('topics[0].categories', reply)
+        self.assertIn('cs.AI', reply)
+        self.assertEqual(len(reports), 1)
+        self.assertIn(reports[0]['id'], reply)
+        self.assertTrue(reports[0]['trace'])
+        self.assertIn(reports[0]['id'], self.service.status())
+        self.assertFalse(self.feed.calls)
+        self.assertEqual(self.generated, 0)
+        self.assertFalse(self.sent)
+
+    async def test_screenshot_category_spacing_is_accepted_by_full_pipeline(self):
+        self.config['topics'][0].update(id='llm', name='1', categories=['cs. AI'],
+            description='我想了解cv，nlp，llm infra领域的最新进展', keywords=['cv', 'nlp', 'llm infra'])
+        for subscription in self.config['subscriptions']:
+            subscription['topic_ids'] = ['llm']
+        reply = await self.service.run(force=True)
+        self.assertNotIn('失败阶段', reply)
+        self.assertEqual(self.service._topics()[0].categories, ('cs.AI',))
+        self.assertEqual(self.generated, 1)
+        self.assertEqual(len(self.sent), 2)
+
+    async def test_bad_subscription_reports_its_field_without_revealing_value(self):
+        self.config['subscriptions'][1]['topic_ids'] = ['secret-config-value']
+        reply = await self.service.run(force=True)
+        self.assertIn('subscriptions[1].topic_ids', reply)
+        self.assertIn('会话订阅第 2 项', reply)
+        self.assertIn('/paper_topics', reply)
+        self.assertNotIn('secret-config-value', reply)
+        self.assertFalse(self.feed.calls)
+
+    async def test_arxiv_failure_keeps_http_status_and_resume_context(self):
+        self.config['topics'].insert(0, {'enabled': False})
+        self.feed.fetch_page = AsyncMock(side_effect=ArxivError('arXiv 请求失败（HTTP 429），请稍后重试'))
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        self.assertIn('arXiv 抓取', reply)
+        self.assertIn('HTTP 429', reply)
+        self.assertIn('分页偏移 0', reply)
+        self.assertIn('研究主题第 2 项（topics[1]）', reply)
+        self.assertEqual(len(reports), 1)
+        self.assertIn(reports[0]['id'], self.service.store.scan(self.service._topics()[0])['error'])
+        self.assertIsNone(self.service.store.scan(self.service._topics()[0])['success'])
+
+    async def test_model_failure_has_actionable_cause_and_persistent_diagnostic(self):
+        self.bad_model = True
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        self.assertIn('模型筛选', reply)
+        self.assertIn('模型未返回有效 JSON', reply)
+        self.assertIn('/paper_retry', reply)
+        saved = json.loads(self.service.store.meta('last_error'))
+        self.assertEqual(reports[0]['id'], saved['id'])
+        await self.restart_service()
+        self.assertIn(saved['id'], self.service.status())
+
+    async def test_unknown_remote_error_never_enters_reply_log_or_database(self):
+        secret = 'Authorization=Bearer SECRET_KEY; https://private.example/api?key=TOKEN'
+        self.feed.fetch_page = AsyncMock(side_effect=ValueError(secret))
+        reports = []
+        self.service.report_error = reports.append
+        reply = await self.service.run(force=True)
+        saved = self.service.store.meta('last_error') + self.service.store.meta('last_status')
+        rendered = reply + saved + json.dumps(reports)
+        for value in ('SECRET_KEY', 'private.example', 'TOKEN', 'Authorization'):
+            self.assertNotIn(value, rendered)
+        self.assertIn('诊断号', reply)
+        self.assertIn('ValueError', reply)
+
+    async def test_delivery_failure_identifies_stage_without_losing_other_targets(self):
+        error = RuntimeError('private response must not be shown')
+        error.status_code = 403
+        async def send(target, text):
+            if target == TARGET_A:
+                raise external_error(error, 'QQ')
+            self.sent.append((target, text))
+            return True
+        self.service.send = send
+        reply = await self.service.run(force=True)
+        self.assertIn('QQ 推送', reply)
+        self.assertIn('HTTP 403', reply)
+        self.assertIn('发言权限', reply)
+        self.assertEqual([target for target, _ in self.sent], [TARGET_B])
+        self.assertNotIn('private response', reply)
+
+    async def test_manual_range_and_pdf_failures_preserve_safe_detail(self):
+        self.feed.fetch_page = AsyncMock(side_effect=ArxivError('arXiv 请求失败（HTTP 503）'))
+        reply = await self.service.fetch_range('reasoning', '2026-10-01', '2026-10-02')
+        self.assertIn('日期范围抓取', reply)
+        self.assertIn('HTTP 503', reply)
+        self.assertIn('续传', reply)
+        topic = self.service._topics()[0]
+        self.service.store.begin_scan(topic, NOW, NOW)
+        self.service.store.accept_page(topic, [PAPER], 1, True)
+        from paperbot.reading import ReadingError
+        with patch('paperbot.reading.read_paper', new=AsyncMock(side_effect=ReadingError('PDF 没有可提取的文字，可能是扫描件；未调用模型'))):
+            reply = await self.service.read(PAPER.id)
+        self.assertIn('全文精读', reply)
+        self.assertIn('扫描件', reply)
+        self.assertEqual(self.generated, 0)
 
     async def test_low_scores_retained_and_lower_threshold_no_rebill(self):
         self.config['topics'][0]['threshold'] = 90

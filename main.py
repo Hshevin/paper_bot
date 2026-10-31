@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import json
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -9,18 +10,32 @@ from astrbot.api.provider import Provider
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .paperbot.service import PaperService
+from .paperbot.errors import ConfigError, SafeError, diagnose, external_error, public_error
 
 
-@register("astrbot_plugin_paper_bot", "Hshevin", "按研究方向筛选并推送 arXiv 论文", "1.0.0")
+COMMAND_CONTEXT = {
+    "run": "立即抓取与分析", "bind": "绑定当前会话订阅", "unbind": "取消当前会话订阅",
+    "subscriptions": "查看当前会话订阅", "retry": "重试论文处理", "read": "手动全文精读",
+    "fetch_range": "指定日期抓取", "status": "查看运行状态", "topics": "查看研究主题",
+}
+
+
+@register("astrbot_plugin_paper_bot", "Hshevin", "按研究方向筛选并推送 arXiv 论文", "1.0.1")
 class PaperBotPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self._log = getattr(self, "logger", logger)
         self.config = config
         self.service = None
         self._task = None
         self._operations = set()
         self._closing = False
         self._startup_error = "插件尚未初始化。"
+        self._scheduler_error = ""
+
+    def _report_error(self, report: dict):
+        record = {"plugin": "astrbot_plugin_paper_bot", "event": "operation_failed", **report}
+        self._log.error(f"[Paper Bot] {json.dumps(record, ensure_ascii=False)}")
 
     async def initialize(self):
         try:
@@ -29,11 +44,12 @@ class PaperBotPlugin(Star):
                 self.config, self._generate, self._send,
                 reader_generate=self._read_generate,
                 save_config=self.config.save_config,
+                report_error=self._report_error,
             )
         except Exception as exc:
-            # Provider/HTTP exceptions can contain API keys and request payloads.
-            logger.error(f"Paper Bot 初始化失败 ({type(exc).__name__})")
-            self._startup_error = "插件初始化失败，请检查插件配置与数据目录权限；现有数据未重置。"
+            report = diagnose(exc, "初始化")
+            self._report_error(report)
+            self._startup_error = public_error(report)
             return
         self._task = asyncio.create_task(self._scheduler(), name="paper-bot-scheduler")
 
@@ -41,10 +57,13 @@ class PaperBotPlugin(Star):
         while True:
             try:
                 await self.service.run()
+                self._scheduler_error = ""
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning(f"Paper Bot 定时任务失败 ({type(exc).__name__})")
+                report = diagnose(exc, "调度")
+                self._report_error(report)
+                self._scheduler_error = public_error(report)
             await asyncio.sleep(60)
 
     async def terminate(self):
@@ -67,15 +86,16 @@ class PaperBotPlugin(Star):
 
     async def _read_generate(self, system: str, user: str) -> str:
         provider_id = str(self.config.get("reading_provider_id", "")).strip()
+        field = "reading_provider_id" if provider_id else "provider_id"
         provider_id = provider_id or str(self.config.get("provider_id", "")).strip()
-        return await self._generate_for(provider_id, system, user)
+        return await self._generate_for(provider_id, system, user, field=field)
 
-    async def _generate_for(self, provider_id: str, system: str, user: str) -> str:
+    async def _generate_for(self, provider_id: str, system: str, user: str, *, field: str = "provider_id") -> str:
         if not provider_id:
-            raise ValueError("请在插件配置中选择用于论文分析的聊天模型。")
+            raise ConfigError("请在插件配置中选择用于论文分析的聊天模型。", field=field)
         provider = self.context.get_provider_by_id(provider_id)
         if not isinstance(provider, Provider):
-            raise ValueError("选定的聊天模型不存在或类型不匹配，请重新选择模型。")
+            raise ConfigError("选定的聊天模型不存在或类型不匹配，请重新选择模型。", field=field)
         try:
             response = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -84,25 +104,25 @@ class PaperBotPlugin(Star):
                 timeout=120,
             )
         except Exception as exc:
-            raise RuntimeError(f"论文模型调用失败 ({type(exc).__name__})") from None
+            raise external_error(exc, "模型") from exc
         text = response.completion_text
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("论文模型返回了空内容。")
+            raise SafeError("论文模型返回了空内容，请检查模型配置后重试。")
         return text
 
     async def _send(self, umo: str, text: str) -> bool:
         parts = umo.split(":", 2)
         if len(parts) != 3 or not all(parts) or parts[1] not in ("GroupMessage", "FriendMessage"):
-            raise ValueError("推送目标应是 QQ 群聊或私聊的完整会话标识，请使用 /paper_target 获取。")
+            raise ConfigError("推送目标应是 QQ 群聊或私聊的完整会话标识，请使用 /paper_target 获取。", field="subscriptions.target")
         platform = self.context.get_platform_inst(parts[0])
         if platform is None:
             return False
         if platform.meta().name != "aiocqhttp":
-            raise ValueError("QQ 定时推送需要 OneBot v11 适配器，例如 NapCat。")
+            raise ConfigError("QQ 定时推送需要 OneBot v11 适配器，例如 NapCat。", field="subscriptions.target")
         try:
             return await self.context.send_message(umo, MessageChain().message(text))
         except Exception as exc:
-            raise RuntimeError(f"QQ 推送失败 ({type(exc).__name__})") from None
+            raise external_error(exc, "QQ") from exc
 
     async def _call(self, event, method, *args, **kwargs):
         # Keep the in-handler check as well as framework filters: these operations
@@ -125,17 +145,21 @@ class PaperBotPlugin(Star):
                     result = await operation
                 finally:
                     self._operations.discard(operation)
-            return str(result)
+            text = str(result)
+            if method == "status" and self._scheduler_error:
+                text += "\n" + self._scheduler_error
+            return text
         except Exception as exc:
-            logger.warning(f"Paper Bot 管理命令失败 ({type(exc).__name__})")
-            return "操作失败，请检查插件配置、模型连接及数据目录；现有进度已保留。"
+            report = diagnose(exc, "管理员命令", context=COMMAND_CONTEXT.get(method, "插件操作"))
+            self._report_error(report)
+            return public_error(report)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("paper_run")
     async def paper_run(self, event: AstrMessageEvent):
         """立即抓取并分析论文，推送至已配置目标。"""
         if event.is_admin() and self.service is not None:
-            yield event.plain_result("开始抓取和筛选论文，完成后推送至已配置目标。")
+            yield event.plain_result("[Paper Bot] 开始抓取和筛选论文，完成后推送至已配置目标。")
         yield await self._call(event, "run", force=True)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -174,7 +198,7 @@ class PaperBotPlugin(Star):
     async def paper_retry(self, event: AstrMessageEvent):
         """重试待处理的论文分析与失败推送。"""
         if event.is_admin() and self.service is not None:
-            yield event.plain_result("开始重试待处理的论文分析与推送。")
+            yield event.plain_result("[Paper Bot] 开始重试待处理的论文分析与推送。")
         yield await self._call(event, "retry")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -185,7 +209,7 @@ class PaperBotPlugin(Star):
             yield event.plain_result("此命令仅限 AstrBot 管理员。")
             return
         if self.service is not None:
-            yield event.plain_result("开始下载论文全文并调用配置的精读模型，完成后在当前会话返回报告。")
+            yield event.plain_result("[Paper Bot] 开始下载论文全文并调用配置的精读模型，完成后在当前会话返回报告。")
         report = await self._invoke("read", paper_id)
         for offset in range(0, len(report), 1500):
             yield event.plain_result(report[offset:offset + 1500])
@@ -195,7 +219,7 @@ class PaperBotPlugin(Star):
     async def paper_fetch(self, event: AstrMessageEvent, topic_id: str, start_date: str, end_date: str):
         """日期抓取：/paper_fetch 主题ID YYYY-MM-DD YYYY-MM-DD（UTC，包含起止整天），随后用 /paper_run 分析推送。"""
         if event.is_admin() and self.service is not None:
-            yield event.plain_result("开始按 UTC 日期范围抓取候选论文；完成后可用 /paper_run 分析并推送。")
+            yield event.plain_result("[Paper Bot] 开始按 UTC 日期范围抓取候选论文；完成后可用 /paper_run 分析并推送。")
         yield await self._call(event, "fetch_range", topic_id, start_date, end_date)
 
     @filter.permission_type(filter.PermissionType.ADMIN)

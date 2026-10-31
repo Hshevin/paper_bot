@@ -16,6 +16,7 @@ from defusedxml.common import DefusedXmlException
 from xml.etree.ElementTree import ParseError
 
 from .models import Paper, Topic
+from .errors import SafeError
 
 API_URL = "https://export.arxiv.org/api/query"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -27,7 +28,7 @@ ID_PATTERN = re.compile(
 )
 
 
-class ArxivError(ValueError):
+class ArxivError(SafeError):
     """A safe user-facing failure without remote response bodies."""
 
 

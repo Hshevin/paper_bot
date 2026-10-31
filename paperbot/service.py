@@ -7,11 +7,13 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sqlite3
 from typing import Awaitable, Callable
 
 import aiohttp
 
 from .arxiv import ArxivClient
+from .errors import ConfigError, SafeError, diagnose, public_error
 from .models import Paper, Topic
 from .scoring import eligible, screen
 from .storage import Storage, decode_paper
@@ -22,68 +24,104 @@ UTC = timezone.utc
 def validate_target(target: str) -> str:
     # The prefix is the adapter INSTANCE id, not the platform type name.
     if not isinstance(target, str) or not re.fullmatch(r"[^:\s]{1,100}:(?:GroupMessage|FriendMessage):[0-9]{1,30}", target):
-        raise ValueError("目标格式应为 适配器实例ID:GroupMessage:群号 或 适配器实例ID:FriendMessage:QQ号；请用 /paper_target 获取")
+        raise ConfigError("目标格式应为 适配器实例ID:GroupMessage:群号 或 适配器实例ID:FriendMessage:QQ号；请用 /paper_target 获取", field="target")
     return target
 
 
 def bounded(config: dict, key: str, default: int, low: int, high: int) -> int:
     value = config.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-        raise ValueError(f"{key} 必须为 {low}–{high} 的整数")
+        raise ConfigError(f"{key} 必须为 {low}–{high} 的整数；请在 WebUI 对应数值框修改", field=key)
     return value
 
 
 class PaperService:
     def __init__(self, data_dir: Path, config: dict,
                  generate: Callable[[str, str], Awaitable[str]],
-                 send: Callable[[str, str], Awaitable[bool]], *, reader_generate=None, save_config=None, client=None, clock=None):
+                 send: Callable[[str, str], Awaitable[bool]], *, reader_generate=None, save_config=None, report_error=None, client=None, clock=None):
         self.config = config
         self.data_dir = data_dir
         self.store = Storage(data_dir)
         self.generate = generate
         self.reader_generate = reader_generate or generate
         self.save_config = save_config
+        self.report_error = report_error
         self.send = send
         self.client = client
         self.session = None
         self.lock = asyncio.Lock()
         self.clock = clock or (lambda: datetime.now(UTC))
         self.closed = False
+        self._phase = "配置校验"
+
+    def _failure(self, exc: Exception, stage: str, context: str = "") -> str:
+        report = diagnose(exc, stage, context=context)
+        report["time"] = self.clock().isoformat()
+        if self.report_error is not None:
+            self.report_error(report)
+        # A broken store must not hide the original diagnostic or get reset.
+        try:
+            self.store.set_meta("last_error", json.dumps(report, ensure_ascii=False))
+        except (sqlite3.Error, OSError):
+            pass
+        return public_error(report)
 
     def _topics(self) -> list[Topic]:
         raw = self.config.get("topics", [])
         if not isinstance(raw, list):
-            raise ValueError("topics 必须是主题列表")
-        topics = [Topic.from_dict(x) for x in raw]
-        if len({t.id for t in topics}) != len(topics):
-            raise ValueError("主题 id 不可重复")
-        return [t for t in topics if t.enabled]
+            raise ConfigError("研究主题必须是列表；请在 WebUI 的共享研究主题目录中添加主题", field="topics")
+        topics = []
+        for index, item in enumerate(raw):
+            if isinstance(item, dict) and item.get("enabled") is False:
+                continue
+            try:
+                topic = Topic.from_dict(item)
+                if any(t.id == topic.id for t in topics):
+                    raise ConfigError("主题 ID 重复，请为每个启用的主题设置不同 ID", field="id")
+            except ConfigError as exc:
+                field = f"topics[{index}]" + (f".{exc.field}" if exc.field != "topics" else "")
+                raise ConfigError(f"研究主题第 {index + 1} 项：{exc}", field=field) from exc
+            topics.append(topic)
+        return topics
 
     def _subscriptions(self) -> list[dict]:
         raw = self.config.get("subscriptions", [])
         if not isinstance(raw, list):
-            raise ValueError("subscriptions 必须是列表")
-        configured = {}
-        for item in raw:
-            target = validate_target(item["target"])
-            if target in configured:
-                raise ValueError("同一目标只能有一条订阅，请合并 topic_ids")
-            configured[target] = item
+            raise ConfigError("会话订阅必须是列表；请在 WebUI 新建群聊或私聊订阅", field="subscriptions")
         known = {t.id for t in self._topics()}
-        all_ids = {t["id"] for t in self.config.get("topics", [])}
+        all_ids = {t["id"].strip() for t in self.config.get("topics", []) if isinstance(t, dict) and isinstance(t.get("id"), str)}
         result = []
-        for target, item in configured.items():
-            validate_target(target)
-            if not item.get("enabled", True):
-                continue
-            ids = item.get("topic_ids", [])
-            if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or i not in all_ids for i in ids):
-                raise ValueError("订阅必须指定已存在的主题 ID")
-            interval = bounded(item, "interval_minutes", bounded(self.config, "interval_minutes", 60, 15, 1440), 15, 1440)
+        seen = set()
+        default_interval = bounded(self.config, "interval_minutes", 60, 15, 1440)
+        for index, item in enumerate(raw):
+            try:
+                if not isinstance(item, dict):
+                    raise ConfigError("订阅必须是配置对象，请在 WebUI 新建会话订阅")
+                if type(item.get("enabled", True)) is not bool:
+                    raise ConfigError("启用状态必须是布尔开关", field="enabled")
+                if not item.get("enabled", True):
+                    continue
+                target = validate_target(item.get("target"))
+                if target in seen:
+                    raise ConfigError("同一目标只能有一条启用的订阅，请合并主题 ID 列表", field="target")
+                seen.add(target)
+                ids = item.get("topic_ids", [])
+                if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or i not in all_ids for i in ids):
+                    raise ConfigError("主题 ID 列表为空或引用了不存在的主题；请用 /paper_topics 查看，并填写主题 ID 而非主题名称", field="topic_ids")
+                interval = bounded(item, "interval_minutes", default_interval, 15, 1440)
+            except ConfigError as exc:
+                field = f"subscriptions[{index}]" + (f".{exc.field}" if exc.field else "")
+                raise ConfigError(f"会话订阅第 {index + 1} 项：{exc}", field=field) from exc
             active = sorted(set(ids) & known)
             if active:
                 result.append({"target": target, "topic_ids": active, "interval_minutes": interval})
         return result
+
+    def _topic_context(self, topic: Topic) -> str:
+        for index, item in enumerate(self.config.get("topics", [])):
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip() == topic.id:
+                return f"研究主题第 {index + 1} 项（topics[{index}]）"
+        return "研究主题"
 
     def bind(self, umo: str, topic_ids: str, interval_minutes: int = 60):
         validate_target(umo)
@@ -137,7 +175,7 @@ class PaperService:
 
     def retry(self):
         if self.lock.locked():
-            raise ValueError("任务运行中，请完成后再重试")
+            raise SafeError("任务运行中，请完成后再重试")
         self.store.retry()
         return "已解除模型暂停并恢复失败队列；/paper_run 可立即重试，否则等待下次订阅检查。"
 
@@ -146,11 +184,16 @@ class PaperService:
 
     def status(self) -> str:
         pause = json.loads(self.store.meta("analysis_pause", "null"))
-        return (f"自动任务：{'已启用' if self.config.get('enabled', False) else '未启用'}\n"
+        counts = [len(self.config.get(k, [])) if isinstance(self.config.get(k, []), list) else 0 for k in ("topics", "subscriptions")]
+        message = (f"自动任务：{'已启用' if self.config.get('enabled', False) else '未启用'}\n"
                 f"运行中：{'是' if self.lock.locked() else '否'}\n"
-                f"主题 {len(self._topics())}，订阅目标 {len(self._subscriptions())}\n"
+                f"主题配置 {counts[0]} 条，订阅配置 {counts[1]} 条（含停用项）\n"
                 f"最近结果：{self.store.meta('last_status', '尚未运行')}\n"
                 f"模型筛选：{'已暂停，请检查提供商后 /paper_retry' if pause else '就绪'}")
+        last_error = json.loads(self.store.meta("last_error", "null"))
+        if last_error and last_error["id"] not in message:
+            message += "\n最近一次错误（历史记录）：\n" + public_error(last_error)
+        return message
 
     async def run(self, force=False) -> str:
         if self.closed:
@@ -160,14 +203,13 @@ class PaperService:
         if not force and not self.config.get("enabled", False):
             return "自动任务未启用"
         async with self.lock:
+            self._phase = "配置校验"
             try:
                 return await self._run(force)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # No remote response, token or arbitrary exception text enters chat/logs.
-                message = f"任务未完成（{type(exc).__name__}），进度已保留，请检查配置或网络"
-                self.store.set_meta("last_status", message)
+                message = self._failure(exc, self._phase)
                 return message
 
     async def _run(self, force: bool) -> str:
@@ -184,6 +226,7 @@ class PaperService:
         pages_budget = bounded(self.config, "max_pages_per_run", 3, 1, 30)
         analysis_budget = bounded(self.config, "max_analyses_per_run", 20, 1, 200)
         push_limit = bounded(self.config, "max_push_per_target", 5, 1, 50)
+        self._phase = "读取任务进度"
         now = self.clock()
         due = []
         for subscription in subscriptions:
@@ -200,11 +243,13 @@ class PaperService:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
             self.client = ArxivClient(self.session)
         fetched = analyzed = sent = failed = 0
+        failures = []
         # Rotate topics across bounded rounds so a large first topic cannot starve later ones.
         rotation = int(self.store.meta("rotation", "0")) % len(topics)
         ordered = topics[rotation:] + topics[:rotation]
         self.store.set_meta("rotation", str((rotation + 1) % len(topics)))
         for topic in ordered:
+            self._phase = "arXiv 抓取"
             scan = self.store.scan(topic)
             if not scan or not scan["until"]:
                 since = datetime.fromisoformat(scan["success"]) - timedelta(days=7) if scan and scan["success"] else now - timedelta(days=lookback)
@@ -218,7 +263,7 @@ class PaperService:
                     papers, total = await self.client.fetch_page(topic, datetime.fromisoformat(scan["since"]), datetime.fromisoformat(scan["until"]), scan["offset"])
                     offset = scan["offset"] + len(papers)
                     if not papers and offset < total:
-                        raise ValueError("Incomplete arXiv page")
+                        raise SafeError("arXiv 返回空页但仍有待抓取记录；进度未推进，请稍后重试")
                     if total > 30000:
                         self.store.shrink_scan(topic)
                         continue
@@ -228,8 +273,11 @@ class PaperService:
                     raise
                 except Exception as exc:
                     failed += 1
-                    self.store.scan_error(topic, type(exc).__name__)
+                    detail = self._failure(exc, "arXiv 抓取", f"{self._topic_context(topic)}，分页偏移 {scan['offset']}")
+                    failures.append(detail)
+                    self.store.scan_error(topic, detail)
                     break
+        self._phase = "模型筛选"
         signature = hashlib.sha256((provider + "|" + "|".join(sorted(t.fingerprint for t in all_topics))).encode()).hexdigest()
         pause = json.loads(self.store.meta("analysis_pause", "null"))
         paused = pause is not None and pause["signature"] == signature
@@ -255,11 +303,14 @@ class PaperService:
                         raise
                     except Exception as exc:
                         failed += 1
-                        self.store.result(topic, paper, None, error=type(exc).__name__)
-                        self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": type(exc).__name__}))
+                        detail = self._failure(exc, "模型筛选", self._topic_context(topic))
+                        failures.append(detail)
+                        self.store.result(topic, paper, None, error=detail)
+                        self.store.set_meta("analysis_pause", json.dumps({"signature": signature, "error": detail}))
                         paused = True
                         break
         for subscription in due:
+            self._phase = "QQ 推送"
             target = subscription["target"]
             candidates = []
             for topic in topics:
@@ -282,11 +333,12 @@ class PaperService:
                 try:
                     accepted = await asyncio.wait_for(self.send(target, format_paper(topic, paper, result)), timeout=60)
                     if accepted is not True:
-                        raise RuntimeError("Adapter did not accept delivery")
+                        raise SafeError("消息平台未接受推送，可能未找到目标的平台实例；请确认 OneBot 已连接，并用 /paper_target 核对完整会话标识")
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     failed += 1
+                    failures.append(self._failure(exc, "QQ 推送", f"本轮订阅第 {due.index(subscription) + 1} 项"))
                     break
                 self.store.mark_sent(topic, target, paper, self.clock())
                 seen.add((paper.id, paper.version))
@@ -295,6 +347,10 @@ class PaperService:
         message = f"本轮抓取 {fetched} 条，分析 {analyzed} 篇，成功投递 {sent} 条，失败 {failed} 项"
         if paused:
             message += "；模型筛选已暂停，请修复后 /paper_retry"
+        if failures:
+            message += "\n\n" + "\n\n".join(failures[:3])
+            if len(failures) > 3:
+                message += "\n其余错误请按诊断编号查看 Paper Bot 插件日志。"
         self.store.set_meta("last_status", message)
         return message
 
@@ -348,7 +404,7 @@ class PaperService:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return f"日期抓取未完成（{type(exc).__name__}）；重复同一命令可续传"
+                    return self._failure(exc, "日期范围抓取", f"分页偏移 {scan['offset']}") + "\n重复同一命令可续传。"
             return f"本轮收集 {count} 条；尚有分页，重复同一命令继续。已收集论文可用 /paper_run 分析"
 
     async def read(self, paper_id: str) -> str:
@@ -373,7 +429,7 @@ class PaperService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return f"全文精读未完成（{type(exc).__name__}）；请检查模型配置、PDF 是否为扫描件或超过限制"
+                return self._failure(exc, "全文精读")
 
     async def close(self):
         if self.closed:

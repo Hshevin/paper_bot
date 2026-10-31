@@ -11,11 +11,12 @@ import json
 import re
 
 from .models import Paper, Screening, Topic
+from .errors import SafeError
 
 Generate = Callable[[str, str], Awaitable[str]]
 
 
-class ScoringError(ValueError):
+class ScoringError(SafeError):
     pass
 
 
